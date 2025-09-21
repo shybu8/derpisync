@@ -1,11 +1,21 @@
+mod error;
+mod index;
 mod tmsu;
 
+use reqwest::StatusCode;
 use serde::Deserialize;
-use std::env;
 use std::io::stdin;
 use std::path::PathBuf;
-use std::process::{Command, Stdio, exit};
+use std::process::exit;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::sleep;
+use std::time::Duration;
 
+use error::GeneralError;
+use index::{load_index, save_index};
 use tmsu::{tag_file, test_tmsu};
 
 #[derive(Debug, Deserialize)]
@@ -19,73 +29,118 @@ struct Image {
     pub tags: Option<Vec<String>>,
 }
 
-const ERR_INV_FNAME: &str = "ERROR: Invalid filename";
-const ERR_INV_JSON: &str = "ERROR: Invalid json";
+const INDEX_FNAME: &str = ".derpisync-index";
 
-fn query_image(id: u64) -> ImagesEndpoint {
+fn query_image(id: u64) -> Result<ImagesEndpoint, GeneralError> {
     let query = format!("https://derpibooru.org/api/v1/json/images/{}", id);
-    let json = reqwest::blocking::get(query)
-        .expect("ERROR: Response receival error")
-        .text()
-        .expect("ERROR: Getting responce text error");
-    serde_json::from_str(&json).expect(ERR_INV_JSON)
+    let mut answer = reqwest::blocking::get(&query)?;
+    while !answer.status().is_success() {
+        match answer.status() {
+            StatusCode::NOT_IMPLEMENTED => {
+                eprintln!("WARN: Got HTTP/501. Waiting for 6 secs to retry...");
+                sleep(Duration::from_secs(6));
+                answer = reqwest::blocking::get(&query)?;
+            }
+            status_code => {
+                eprintln!(
+                    "WARN: Got HTTP/{}. Waiting for 1 sec to retry...",
+                    status_code
+                );
+                sleep(Duration::from_secs(1));
+                answer = reqwest::blocking::get(&query)?;
+            }
+        }
+    }
+    let json = answer.text()?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+fn find_image_tags(id: u64) -> Result<Option<Vec<String>>, GeneralError> {
+    let mut data = query_image(id)?;
+    while data.image.tags.is_none()
+        && let Some(origin) = data.image.duplicate_of
+    {
+        data = query_image(origin)?;
+    }
+    if let Some(tags) = data.image.tags {
+        return Ok(Some(tags));
+    } else {
+        return Ok(None);
+    }
+}
+
+fn id_from_filepath(filepath: &str, path_buf: &mut PathBuf) -> Option<u64> {
+    path_buf.clear();
+    path_buf.push(filepath);
+    let file_name = path_buf.file_name()?.to_str()?;
+    let id_str = if file_name.contains("__") {
+        file_name.split("__").next().unwrap()
+    } else {
+        file_name.split(".").next().unwrap()
+    };
+    u64::from_str_radix(id_str, 10).ok()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let mut args = env::args();
-    // if args.len() != 2 {
-    //     eprintln!("USAGE: derpisync FILENAME_OUT_OF_ID_AND_EXTENSION");
-    //     exit(1);
-    // }
+    let should_close = Arc::new(AtomicBool::new(false));
+    let sc = should_close.clone();
 
-    // let _ = args.next(); // Program name
-    // let file_str = args.next().unwrap();
-    // let file_path = PathBuf::from(&file_str);
-    // let file_name = file_path
-    //     .file_name()
-    //     .expect(ERR_INV_FNAME)
-    //     .to_str()
-    //     .expect(ERR_INV_FNAME);
-    // let image_id = file_name.split(".").next().expect(ERR_INV_FNAME);
-    // let image_id = u64::from_str_radix(&image_id, 10).expect("ERROR: Invalid image id");
+    ctrlc::set_handler(move || {
+        sc.store(true, Ordering::SeqCst);
+    })?;
 
     if let Err(e) = test_tmsu() {
         eprintln!("{}", e);
         exit(1);
     }
 
+    let mut btree = load_index(INDEX_FNAME)?;
+
     let stdin = stdin();
     let mut line = String::new();
     let mut path_buf = PathBuf::new();
-    let mut succ_flag: bool;
 
-    while stdin.read_line(&mut line)? != 0 {
-        succ_flag = true;
+    while !should_close.load(Ordering::SeqCst) && stdin.read_line(&mut line)? != 0 {
         let filepath = line.trim_end();
-        path_buf.push(filepath);
-        let file_name = path_buf
-            .file_name()
-            .expect(ERR_INV_FNAME)
-            .to_str()
-            .expect(ERR_INV_FNAME);
-        let image_id = file_name.split(".").next().expect(ERR_INV_FNAME);
-        let image_id = u64::from_str_radix(&image_id, 10).expect("ERROR: Invalid image id");
-        let mut img = query_image(image_id);
-        if img.image.tags.is_none() {
-            if let Some(original) = img.image.duplicate_of {
-                img = query_image(original);
+
+        if btree.get(filepath).is_none() {
+            let image_id = match id_from_filepath(filepath, &mut path_buf) {
+                Some(id) => id,
+                None => {
+                    println!(
+                        "INFO: Doesn't look like derpibooru's downloaded image filename, skipping: {}",
+                        filepath
+                    );
+                    line.clear();
+                    continue;
+                }
+            };
+            let tags = match find_image_tags(image_id) {
+                Ok(Some(a)) => a,
+                Ok(None) => {
+                    eprintln!("INFO: Tags for {} are unavailable", filepath);
+                    btree.insert(filepath.to_string());
+                    line.clear();
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("ERROR: While getting tags for {}: {}", filepath, e);
+                    line.clear();
+                    continue;
+                }
+            };
+
+            if let Err(e) = tag_file(filepath, tags) {
+                eprintln!("While tagging {}: {}", filepath, e);
             } else {
-                println!("INFO: Tags are unavaliable for {}", line);
-                succ_flag = false;
+                btree.insert(filepath.to_string());
+                println!("INFO: {} is done", filepath);
             }
         }
 
-        if succ_flag && let Err(e) = tag_file(filepath, img.image.tags.unwrap()) {
-            eprintln!("While tagging {}: {}", line, e);
-        }
-
         line.clear();
-        path_buf.clear();
     }
+
+    save_index(INDEX_FNAME, btree)?;
     Ok(())
 }
