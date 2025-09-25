@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use error::GeneralError;
 use index::{load_index, save_index};
@@ -30,8 +30,14 @@ struct Image {
 }
 
 const INDEX_FNAME: &str = ".derpisync-index";
+const API_LIMIT_PER_SEC: f64 = 0.9;
 
-fn query_image(id: u64) -> Result<ImagesEndpoint, GeneralError> {
+fn query_image(id: u64, last_ts: &mut Instant) -> Result<ImagesEndpoint, GeneralError> {
+    let api_delay = Duration::from_secs_f64(1.0 / API_LIMIT_PER_SEC);
+    let remaining_delay = api_delay.saturating_sub(Instant::now() - *last_ts);
+    sleep(remaining_delay);
+    *last_ts = Instant::now();
+
     let query = format!("https://derpibooru.org/api/v1/json/images/{}", id);
     let mut answer = reqwest::blocking::get(&query)?;
     while !answer.status().is_success() {
@@ -55,12 +61,15 @@ fn query_image(id: u64) -> Result<ImagesEndpoint, GeneralError> {
     Ok(serde_json::from_str(&json)?)
 }
 
-fn find_image_tags(id: u64) -> Result<Option<Vec<String>>, GeneralError> {
-    let mut data = query_image(id)?;
+fn find_image_tags(
+    id: u64,
+    last_download_ts: &mut Instant,
+) -> Result<Option<Vec<String>>, GeneralError> {
+    let mut data = query_image(id, last_download_ts)?;
     while data.image.tags.is_none()
         && let Some(origin) = data.image.duplicate_of
     {
-        data = query_image(origin)?;
+        data = query_image(origin, last_download_ts)?;
     }
     if let Some(tags) = data.image.tags {
         return Ok(Some(tags));
@@ -99,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = stdin();
     let mut line = String::new();
     let mut path_buf = PathBuf::new();
+    let mut last_download_ts = Instant::now();
 
     while !should_close.load(Ordering::SeqCst) && stdin.read_line(&mut line)? != 0 {
         let filepath = line.trim_end();
@@ -115,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            let tags = match find_image_tags(image_id) {
+            let tags = match find_image_tags(image_id, &mut last_download_ts) {
                 Ok(Some(a)) => a,
                 Ok(None) => {
                     eprintln!("INFO: Tags for {} are unavailable", filepath);
