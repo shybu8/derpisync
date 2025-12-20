@@ -7,14 +7,11 @@ After tmsu is installed and it's database initialized with `tmsu init` you can p
 ```bash
 cd dir-with-your-images
 tmsu init
-ls | derpisync
+derpisync
 ```
-or
-```bash
-find -type f | derpisync
-```
+
 `derpisync` will create **.derpisync-index** file in working directory to keep track for files which already have synced tags.
-> Note: It always uses **.derpisync-index** in working directory therefore it's reccomended to always launch it from the same dir to avoid duplicating info
+> Note: It always uses **.derpisync-index** in working directory therefore it's recommended to always launch it from the same dir to avoid duplicating info
 ## Build and installation
 ```bash
 git clone https://github.com/shybu8/derpisync.git

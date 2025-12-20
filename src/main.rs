@@ -4,7 +4,6 @@ mod tmsu;
 
 use reqwest::StatusCode;
 use serde::Deserialize;
-use std::io::stdin;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::{
@@ -13,6 +12,7 @@ use std::sync::{
 };
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use walkdir::WalkDir;
 
 use error::GeneralError;
 use index::{load_index, save_index};
@@ -31,6 +31,10 @@ struct Image {
 
 const INDEX_FNAME: &str = ".derpisync-index";
 const API_LIMIT_PER_SEC: f64 = 0.9;
+
+const AES_BOLD_GREEN: &str = "\x1b[1;32m";
+const AES_BOLD_RED: &str = "\x1b[1;31m";
+const AES_CLEAR: &str = "\x1b[0m";
 
 fn query_image(id: u64, last_ts: &mut Instant) -> Result<ImagesEndpoint, GeneralError> {
     let api_delay = Duration::from_secs_f64(1.0 / API_LIMIT_PER_SEC);
@@ -90,6 +94,14 @@ fn id_from_filepath(filepath: &str, path_buf: &mut PathBuf) -> Option<u64> {
     u64::from_str_radix(id_str, 10).ok()
 }
 
+fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map(|s| s.starts_with("."))
+        .unwrap_or(false)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let should_close = Arc::new(AtomicBool::new(false));
     let sc = should_close.clone();
@@ -104,51 +116,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut btree = load_index(INDEX_FNAME)?;
-
-    let stdin = stdin();
-    let mut line = String::new();
     let mut path_buf = PathBuf::new();
     let mut last_download_ts = Instant::now();
 
-    while !should_close.load(Ordering::SeqCst) && stdin.read_line(&mut line)? != 0 {
-        let filepath = line.trim_end();
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|f| f.file_type().is_file() && !is_hidden(f))
+    {
+        if should_close.load(Ordering::SeqCst) {
+            break;
+        }
 
-        if btree.get(filepath).is_none() {
-            let image_id = match id_from_filepath(filepath, &mut path_buf) {
+        let filepath_str = entry.path().to_str().unwrap();
+
+        if btree.get(filepath_str).is_none() {
+            let image_id = match id_from_filepath(filepath_str, &mut path_buf) {
                 Some(id) => id,
                 None => {
-                    println!(
-                        "INFO: Doesn't look like derpibooru's downloaded image filename, skipping: {}",
-                        filepath
+                    eprintln!(
+                        "{}INFO{}: Doesn't look like derpibooru's downloaded image filename, skipping: {}",
+                        AES_BOLD_GREEN, AES_CLEAR, filepath_str
                     );
-                    line.clear();
                     continue;
                 }
             };
             let tags = match find_image_tags(image_id, &mut last_download_ts) {
                 Ok(Some(a)) => a,
                 Ok(None) => {
-                    eprintln!("INFO: Tags for {} are unavailable", filepath);
-                    btree.insert(filepath.to_string());
-                    line.clear();
+                    eprintln!(
+                        "{}INFO{}: Tags for {} are unavailable",
+                        AES_BOLD_GREEN, AES_CLEAR, filepath_str
+                    );
+                    btree.insert(filepath_str.to_string());
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("ERROR: While getting tags for {}: {}", filepath, e);
-                    line.clear();
+                    eprintln!(
+                        "{}ERROR{}: While getting tags for {}: {}",
+                        AES_BOLD_RED, AES_CLEAR, filepath_str, e
+                    );
                     continue;
                 }
             };
 
-            if let Err(e) = tag_file(filepath, tags) {
-                eprintln!("While tagging {}: {}", filepath, e);
+            if let Err(e) = tag_file(filepath_str, tags) {
+                eprintln!(
+                    "{}ERROR{}: While tagging {}: {}",
+                    AES_BOLD_RED, AES_CLEAR, filepath_str, e
+                );
             } else {
-                btree.insert(filepath.to_string());
-                println!("INFO: {} is done", filepath);
+                btree.insert(filepath_str.to_string());
+                println!(
+                    "{}INFO{}: {} is done",
+                    AES_BOLD_GREEN, AES_CLEAR, filepath_str
+                );
             }
         }
-
-        line.clear();
     }
 
     save_index(INDEX_FNAME, btree)?;
