@@ -94,11 +94,11 @@ fn id_from_filepath(filepath: &str, path_buf: &mut PathBuf) -> Option<u64> {
     u64::from_str_radix(id_str, 10).ok()
 }
 
-fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+fn should_omit(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()
         .to_str()
-        .map(|s| s.starts_with("."))
+        .map(|s| s.starts_with(".") || s.starts_with("db"))
         .unwrap_or(false)
 }
 
@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for entry in WalkDir::new(".")
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|f| f.file_type().is_file() && !is_hidden(f))
+        .filter(|f| f.file_type().is_file() && !should_omit(f))
     {
         if should_close.load(Ordering::SeqCst) {
             break;
