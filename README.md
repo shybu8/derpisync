@@ -3,7 +3,7 @@
 **Derpisync** is intended to synchronize tags of images from *derpibooru* with your localy stored images (using **tmsu** as local tagging backend).
 ## Usage
 To use **derpisync** you need **tmsu** to be installed.
-After tmsu is installed and it's database initialized with `tmsu init` you can pipe desired filenames to be synced into `derpisync`
+After tmsu is installed and it's database initialized with `tmsu init` you can execute `derpisync` to synchronize tags.
 ```bash
 cd dir-with-your-images
 tmsu init
